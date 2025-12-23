@@ -160,6 +160,55 @@ def reasoning_engine(state: AgentState) -> dict:
 
 # ... (Previous ContextLoader, ChatResponder, Recovery, ToolGateway stay same)
 
+def tool_gateway(state: AgentState) -> dict:
+    """
+    Executes the tool command. Handles failures explicitly.
+    Uses Embedded Filesystem MCP for file operations.
+    """
+    from arc.mcp.filesystem import FilesystemMCP
+    
+    cmd = state.get("tool_command")
+    if not cmd:
+        return {"failure_reason": "No tool command specified."}
+        
+    tool_name = cmd.get("name")
+    tool_args = cmd.get("args", {})
+    
+    logger.info(f"🛠️ Executing: {tool_name} with {tool_args}")
+    
+    try:
+        # Filesystem MCP Routing
+        fs_tools = ["list_files", "list_directory", "read_file", "write_file", "create_file", "delete_file"]
+        
+        if tool_name in fs_tools:
+            mcp = FilesystemMCP()
+            # Map legacy 'list_files' to mcp 'list_directory'
+            op = "list_directory" if tool_name == "list_files" else tool_name
+            
+            # Map legacy args (list_files had no args usually, but MCP needs path)
+            if op == "list_directory" and "path" not in tool_args:
+                tool_args["path"] = "."
+                
+            response = mcp.execute(op, tool_args)
+            
+            if response["status"] == "success":
+                return {"tool_result": str(response["data"])}
+            else:
+                return {"failure_reason": f"File Op Failed: {response.get('error')}"}
+
+        # Legacy / Other Tools
+        result = ""
+        if tool_name == "list_apps":
+            result = "Apps: Code, Chrome, Terminal (Mock)"
+        elif tool_name not in fs_tools: # Unknown tool
+             raise ValueError(f"Tool '{tool_name}' not found.")
+            
+        return {"tool_result": result}
+        
+    except Exception as e:
+        logger.error(f"Tool execution failed: {e}")
+        return {"failure_reason": str(e)}
+
 def memory_processor(state: AgentState) -> dict:
     """
     Sequential Memory Processor (Phase 5).

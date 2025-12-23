@@ -63,6 +63,9 @@ class VoiceConfig(BaseModel):
     stt_model_size: Literal["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large"] = "base"
     tts_voice: str = "en_US-lessac-medium"
 
+class FilesystemConfig(BaseModel):
+    allowed_roots: List[str] = Field(default_factory=lambda: [os.getcwd()])
+
 class SystemConfig(BaseModel):
     project_root: Path = Field(default=PROJECT_ROOT)
     models_dir: Path = Field(default=DEFAULT_MODELS_DIR)
@@ -91,6 +94,7 @@ class Settings(BaseSettings):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
+    filesystem: FilesystemConfig = Field(default_factory=FilesystemConfig)
     system: SystemConfig = Field(default_factory=SystemConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
