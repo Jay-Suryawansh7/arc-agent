@@ -163,10 +163,11 @@ def reasoning_engine(state: AgentState) -> dict:
 def tool_gateway(state: AgentState) -> dict:
     """
     Executes the tool command. Handles failures explicitly.
-    Uses Embedded Filesystem MCP & Browser MCP.
+    Uses Embedded Filesystem MCP, Browser MCP, & Web Reader MCP.
     """
     from arc.mcp.filesystem import FilesystemMCP
     from arc.mcp.browser import BrowserMCP
+    from arc.mcp.web_reader import WebReaderMCP
     
     cmd = state.get("tool_command")
     if not cmd:
@@ -180,31 +181,26 @@ def tool_gateway(state: AgentState) -> dict:
     try:
         # --- Filesystem MCP ---
         fs_tools = ["list_files", "list_directory", "read_file", "write_file", "create_file", "delete_file"]
-        
         if tool_name in fs_tools:
             mcp = FilesystemMCP()
-            # Map legacy 'list_files' to mcp 'list_directory'
             op = "list_directory" if tool_name == "list_files" else tool_name
-            
-            # Map legacy args
             if op == "list_directory" and "path" not in tool_args:
                 tool_args["path"] = "."
-                
             response = mcp.execute(op, tool_args)
-            if response["status"] == "success":
-                return {"tool_result": str(response["data"])}
-            else:
-                return {"failure_reason": f"File Op Failed: {response.get('error')}"}
+            return {"tool_result": str(response["data"])} if response["status"] == "success" else {"failure_reason": f"File Op Failed: {response.get('error')}"}
 
         # --- Browser MCP ---
         browser_tools = ["open_url", "search_web", "open_web_app"]
         if tool_name in browser_tools:
             mcp = BrowserMCP()
             response = mcp.execute(tool_name, tool_args)
-            if response["status"] == "success":
-                 return {"tool_result": str(response["data"])}
-            else:
-                 return {"failure_reason": f"Browser Op Failed: {response.get('error')}"}
+            return {"tool_result": str(response["data"])} if response["status"] == "success" else {"failure_reason": f"Browser Op Failed: {response.get('error')}"}
+
+        # --- Web Reader MCP ---
+        if tool_name == "read_webpage":
+            mcp = WebReaderMCP()
+            response = mcp.execute(tool_name, tool_args)
+            return {"tool_result": str(response["data"])} if response["status"] == "success" else {"failure_reason": f"Web Read Failed: {response.get('error')}"}
 
         # --- Legacy / Other Tools ---
         result = ""
