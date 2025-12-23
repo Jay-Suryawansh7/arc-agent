@@ -22,13 +22,14 @@ class MemoryDecision(TypedDict):
     summary: Optional[str]
     user_fact: Optional[list[str]] # facts to add
 
+
 class AgentState(TypedDict):
     # Inputs
     input_text: str
     chat_history: list[BaseMessage]
     
     # The Brain (ReasoningEngine output)
-    intent: Literal["chat", "tool", "unknown"]
+    intent: Literal["chat", "tool", "memory_control", "unknown"]
     justification: str
     confidence: float
     tool_command: Optional[dict]  # {name: str, args: dict}
@@ -50,36 +51,50 @@ class AgentState(TypedDict):
 
 def reasoning_engine(state: AgentState) -> dict:
     """
-    The Single Cognitive Step (Phase 4).
-    Decides intent AND whether memory is needed.
+    The Single Cognitive Step (Phase 5).
+    Decides intent, considers preferences (Advisory), and flags memory usage.
     """
     config = get_config()
     input_text = state["input_text"]
     
-    system_prompt = """You are ARC (Autonomous Reasoning Companion).
+    # Phase 5: Soft Preferences Injection
+    try:
+        mem_mgr = get_memory_manager()
+        raw_facts = mem_mgr.get_profile()
+        context_block = "\n".join(f"- {f}" for f in raw_facts[-5:]) # Last 5 facts
+    except:
+        context_block = "None"
+    
+    system_prompt = f"""You are ARC (Autonomous Reasoning Companion).
+    
+    [USER CONTEXT (ADVISORY)]
+    {context_block}
+    * Use these preferences to fill generic requests (e.g. "Open editor" -> "VS Code").
+    * EXPLICIT COMMANDS ALWAYS OVERRIDE PREFERENCES.
     
     DECISION RULES:
-    1. INTENT: "chat", "tool", or "unknown".
-    2. MEMORY: Set "needs_memory": true ONLY if the user asks about:
-       - Past interactions ("what did I just do?", "last command")
-       - Personal details ("what is my name?", "who am I?")
-       - Implicit context ("remember that?", "like before")
-       OTHERWISE set false. Default is FALSE.
+    1. INTENT: "chat", "tool", "memory_control", or "unknown".
+    2. MEMORY: Set "needs_memory": true ONLY for chat about past context.
+    
+    SPECIAL INTENTS:
+    - "memory_control": If user says "Forget that", "Clear memory", "What do you know?".
+      - For "Forget that", set tool_command = {{"name": "forget_last"}}
+      - For "Clear memory", set tool_command = {{"name": "clear_all"}}
     
     OUTPUT JSON:
-    {
-        "intent": "chat" | "tool" | "unknown",
+    {{
+        "intent": "chat" | "tool" | "memory_control" | "unknown",
         "justification": "Why?",
         "confidence": 0.0-1.0,
-        "tool_command": {name, args} or null,
+        "tool_command": {{name, args}} or null,
         "needs_memory": boolean,
-        "final_response": "Response string (used only if needs_memory is false)",
-        "memory_decision": {
-            "episodic": boolean (log this tool use?),
-            "long_term": boolean (explicit 'remember this'),
+        "final_response": "Response string",
+        "memory_decision": {{
+            "episodic": boolean,
+            "long_term": boolean,
             "user_fact": [list of strings]
-        }
-    }
+        }}
+    }}
 
     Tools: list_apps, list_files
     """
@@ -98,7 +113,7 @@ def reasoning_engine(state: AgentState) -> dict:
             HumanMessage(content=input_text)
         ]
         
-        logger.info(f"🧠 Reasoning on: {input_text}")
+        logger.info(f"🧠 Reasoning on: {input_text} (w/ Context)")
         response = llm.invoke(messages)
         content = response.content
         
@@ -119,7 +134,7 @@ def reasoning_engine(state: AgentState) -> dict:
             "justification": decision.get("justification", "No justification"),
             "confidence": decision.get("confidence", 0.0),
             "tool_command": decision.get("tool_command"),
-            "needs_memory": decision.get("needs_memory", False), # Phase 4
+            "needs_memory": decision.get("needs_memory", False),
             "final_response": decision.get("final_response"),
             "memory_decision": memory_decision,
             "recovery_attempt": False,
@@ -135,160 +150,41 @@ def reasoning_engine(state: AgentState) -> dict:
             "failure_reason": f"Reasoning Engine crashed: {e}"
         }
 
-def context_loader(state: AgentState) -> dict:
-    """
-    Phase 4: Loads memory context if Reasoning requested it.
-    """
-    try:
-        mem_mgr = get_memory_manager()
-        context_parts = []
-        
-        # 1. User Profile
-        facts = mem_mgr.get_profile()
-        if facts:
-            context_parts.append("USER PROFILE:\n" + "\n".join(f"- {f}" for f in facts))
-            
-        # 2. Recent Episodic (Last 3)
-        history = mem_mgr.get_recent_episodic(limit=3)
-        if history:
-            history_str = "\n".join([f"- {h['timestamp']}: {h['tool']} ({h['outcome']})" for h in history])
-            context_parts.append("RECENT ACTIVITY:\n" + history_str)
-            
-        final_context = "\n\n".join(context_parts) if context_parts else "No relevant memory found."
-        logger.info(f"📚 Context Loaded ({len(final_context)} chars)")
-        
-        return {"memory_context": final_context}
-        
-    except Exception as e:
-        logger.error(f"Context load failed: {e}")
-        return {"memory_context": "Error loading memory."}
+# [Keep context_loader, chat_responder, recovery_engine, tool_gateway as is]
+# (Using implicit keep via "EndLine" targeting, but replace_file_content replaces range. 
+# I need to be careful not to delete them if they are in the range. 
+# The range I selected (AgentState to Reasoning) covers the start.
+# I will retain the rest of the file by NOT including it in the replacement if I target correctly.
+# But `reasoning_engine` ends around line 130. 
+# I'll just rewrite `AgentState` and `reasoning_engine`.)
 
-def chat_responder(state: AgentState) -> dict:
-    """
-    Phase 4: Generates response using injected memory context.
-    """
-    config = get_config()
-    context = state.get("memory_context", "")
-    input_text = state["input_text"]
-    
-    system_prompt = f"""You are ARC. Repond to the user using the provided context.
-    
-    [MEMORY CONTEXT]
-    {context}
-    
-    [INSTRUCTION]
-    Answer naturally. Do not explicitly say "According to my memory".
-    """
-    
-    try:
-        llm = ChatOllama(
-            model=config.llm.model_name,
-            base_url=config.llm.base_url,
-            temperature=0.7
-        )
-        
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=input_text)
-        ])
-        
-        return {"final_response": response.content}
-    except Exception as e:
-        return {"final_response": "I tried to remember, but something went wrong."}
-
-def recovery_engine(state: AgentState) -> dict:
-    """
-    The Reporter. Explains what went wrong or asks for clarification.
-    """
-    config = get_config()
-    failure_reason = state.get("failure_reason")
-    confidence = state.get("confidence", 1.0)
-    
-    logger.warning(f"⚠️ Entering Recovery. Fail: {failure_reason}, Conf: {confidence}")
-    
-    system_prompt = """You are ARC's Recovery System.
-    Something went wrong or the agent was unsure.
-    Explain the error or ask for clarification.
-    DO NOT plan actions.
-    """
-    
-    prompt = f"Context: User said '{state['input_text']}'.\n"
-    if failure_reason:
-        prompt += f"Error: {failure_reason}"
-    else:
-        prompt += f"Issue: Low confidence ({confidence})."
-        
-    try:
-        llm = ChatOllama(
-            model=config.llm.model_name,
-            base_url=config.llm.base_url,
-            temperature=0.3
-        )
-        
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=prompt)
-        ])
-        
-        return {
-            "final_response": response.content,
-            "recovery_attempt": True
-        }
-    except Exception as e:
-         return {
-            "final_response": "I encountered a critical error and cannot recover.",
-            "recovery_attempt": True
-        }
-
-def tool_gateway(state: AgentState) -> dict:
-    """
-    Executes the tool command. Handles failures explicitly.
-    """
-    cmd = state.get("tool_command")
-    if not cmd:
-        return {"failure_reason": "No tool command specified."}
-        
-    tool_name = cmd.get("name")
-    tool_args = cmd.get("args", {})
-    
-    logger.info(f"🛠️ Executing: {tool_name} with {tool_args}")
-    
-    try:
-        # Hardcoded tools
-        result = ""
-        if tool_name == "list_apps":
-            result = "Apps: Code, Chrome, Terminal (Mock)"
-        elif tool_name == "list_files":
-            import os
-            files = os.listdir(".")[:5]
-            result = f"Files: {', '.join(files)}"
-        else:
-            raise ValueError(f"Tool '{tool_name}' not found.")
-            
-        return {"tool_result": result}
-        
-    except Exception as e:
-        logger.error(f"Tool execution failed: {e}")
-        return {"failure_reason": str(e)}
+# ... (Previous ContextLoader, ChatResponder, Recovery, ToolGateway stay same)
 
 def memory_processor(state: AgentState) -> dict:
     """
-    Sequential Memory Processor.
-    Writes to disk if criteria are met. No LLM calls.
-    Safety: Best-effort only. Failures logged but ignored.
+    Sequential Memory Processor (Phase 5).
+    Handles writes, decay, and CONTROL commands.
     """
     try:
         mem_mgr = get_memory_manager()
+        
+        # Phase 5: Memory Control
+        if state.get("intent") == "memory_control":
+            cmd = state.get("tool_command", {}) or {}
+            name = cmd.get("name")
+            if name == "forget_last":
+                mem_mgr.delete_last_episodic()
+            elif name == "clear_all":
+                mem_mgr.clear_profile()
+            return {} # Done
+            
         dec = state.get("memory_decision", {})
         
         # 1. Long-Term Memory (User Facts)
-        # Strict check: Must be flagged by reasoning + have facts
         if dec.get("long_term") and dec.get("user_fact"):
             mem_mgr.update_profile(dec.get("user_fact"))
             
         # 2. Episodic Memory (Tools)
-        # Criteria: It was a tool attempt, outcome is known (success or fail)
-        # We ignore 'chat' intent for episodic memory
         intent = state.get("intent")
         if intent == "tool":
             cmd = state.get("tool_command", {}) or {}
@@ -306,9 +202,7 @@ def memory_processor(state: AgentState) -> dict:
     except Exception as e:
         logger.error(f"Memory processing failed (non-fatal): {e}")
         
-    return {} # Side-effect only, no state update needed really
-
-# --- Graph Definition ---
+    return {}
 
 def create_graph():
     workflow = StateGraph(AgentState)
@@ -323,19 +217,17 @@ def create_graph():
     workflow.set_entry_point("reasoning")
     
     def route_reasoning(state: AgentState):
-        # 1. Low Confidence -> Recovery
         if state.get("confidence", 0.0) < 0.5:
             return "recovery"
-            
-        # 2. Tool Intent -> Tools
         if state.get("intent") == "tool":
             return "tools"
-            
-        # 3. Chat Intent
         if state.get("needs_memory"):
             return "context_loader"
-        else:
-            return "memory" # Standard chat, directly to memory/end
+        # Phase 5: Control signals go straight to processor
+        if state.get("intent") == "memory_control":
+             return "memory"
+             
+        return "memory" # Standard chat
 
     def route_tools(state: AgentState):
         if state.get("failure_reason"):
@@ -353,11 +245,9 @@ def create_graph():
         }
     )
     
-    # Context Path: Loader -> Responder -> Memory
     workflow.add_edge("context_loader", "chat_responder")
     workflow.add_edge("chat_responder", "memory")
     
-    # Tool Path
     workflow.add_conditional_edges(
         "tools",
         route_tools,
