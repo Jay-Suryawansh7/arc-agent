@@ -163,9 +163,10 @@ def reasoning_engine(state: AgentState) -> dict:
 def tool_gateway(state: AgentState) -> dict:
     """
     Executes the tool command. Handles failures explicitly.
-    Uses Embedded Filesystem MCP for file operations.
+    Uses Embedded Filesystem MCP & Browser MCP.
     """
     from arc.mcp.filesystem import FilesystemMCP
+    from arc.mcp.browser import BrowserMCP
     
     cmd = state.get("tool_command")
     if not cmd:
@@ -177,7 +178,7 @@ def tool_gateway(state: AgentState) -> dict:
     logger.info(f"🛠️ Executing: {tool_name} with {tool_args}")
     
     try:
-        # Filesystem MCP Routing
+        # --- Filesystem MCP ---
         fs_tools = ["list_files", "list_directory", "read_file", "write_file", "create_file", "delete_file"]
         
         if tool_name in fs_tools:
@@ -185,22 +186,31 @@ def tool_gateway(state: AgentState) -> dict:
             # Map legacy 'list_files' to mcp 'list_directory'
             op = "list_directory" if tool_name == "list_files" else tool_name
             
-            # Map legacy args (list_files had no args usually, but MCP needs path)
+            # Map legacy args
             if op == "list_directory" and "path" not in tool_args:
                 tool_args["path"] = "."
                 
             response = mcp.execute(op, tool_args)
-            
             if response["status"] == "success":
                 return {"tool_result": str(response["data"])}
             else:
                 return {"failure_reason": f"File Op Failed: {response.get('error')}"}
 
-        # Legacy / Other Tools
+        # --- Browser MCP ---
+        browser_tools = ["open_url", "search_web", "open_web_app"]
+        if tool_name in browser_tools:
+            mcp = BrowserMCP()
+            response = mcp.execute(tool_name, tool_args)
+            if response["status"] == "success":
+                 return {"tool_result": str(response["data"])}
+            else:
+                 return {"failure_reason": f"Browser Op Failed: {response.get('error')}"}
+
+        # --- Legacy / Other Tools ---
         result = ""
         if tool_name == "list_apps":
             result = "Apps: Code, Chrome, Terminal (Mock)"
-        elif tool_name not in fs_tools: # Unknown tool
+        elif tool_name not in fs_tools and tool_name not in browser_tools:
              raise ValueError(f"Tool '{tool_name}' not found.")
             
         return {"tool_result": result}
