@@ -99,8 +99,8 @@ class CommandRouter:
                 except:
                     pass
         
-        # App opening - extract app name more flexibly
-        # prioritize "open" commands over "list" commands to avoid false positives like "WhatsApp"
+        # App opening - Generic fallback for ANY app
+        # This handles "Open [App Name]" for any system application
         if 'open' in text_lower or 'launch' in text_lower or 'start' in text_lower:
             patterns = [
                 r'(?:open|launch|start)\s+(?:the\s+)?([a-zA-Z]+(?:\s+[a-zA-Z]+)?)',
