@@ -1,0 +1,27 @@
+[project]
+name = "arc-assistant"
+version = "0.1.0"
+description = "ARC - Autonomous Reasoning Companion: A Jarvis-like AI assistant with voice control and MCP integration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain-community",
+    "llama-cpp-python",
+    "openai-whisper",
+    "piper-tts",
+    "pyaudio",
+    "pvporcupine",
+    "pyautogui",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "langchain-ollama",
+    "langchain-openai",
+    "psutil",
+    "langgraph",
+    "cryptography",
+    "rich",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
