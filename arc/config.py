@@ -60,7 +60,7 @@ class MCPConfig(BaseModel):
 class VoiceConfig(BaseModel):
     wake_word: str = Field("jarvis", description="Wake word to listen for")
     porcupine_access_key: Optional[SecretStr] = Field(None, description="Access key for Porcupine")
-    stt_model_size: Literal["tiny", "base", "small", "medium", "large"] = "base"
+    stt_model_size: Literal["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large"] = "base"
     tts_voice: str = "en_US-lessac-medium"
 
 class SystemConfig(BaseModel):

@@ -9,6 +9,12 @@ import logging
 import sys
 from pathlib import Path
 from typing import Optional
+import platform
+
+# Windows-specific: Enable UTF-8 for console output to support emojis
+if platform.system() == 'Windows':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
 
 __version__ = "0.1.0"
 

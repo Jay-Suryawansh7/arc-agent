@@ -139,82 +139,68 @@ class CommandRouter:
         
         return None
 
-async def agent_callback(user_input: str) -> str:
-    """Process user input and return response."""
-    config = get_config()
-    router = CommandRouter()
-    
-    # Try tool routing first
-    tool_cmd = router.detect_tool_command(user_input)
-    
-    if tool_cmd:
-        tool_name, params = tool_cmd
-        
-        try:
-            if tool_name == 'list_apps':
-                apps = list_running_apps.invoke({})
-                return f"You have {len(apps)} apps running. Top 10:\n" + "\n".join(f"- {app}" for app in apps[:10])
-            
-            elif tool_name == 'open_url':
-                import subprocess
-                url = params['url']
-                is_guess = params.get('guess', False)
-                
-                if is_guess:
-                    # Try .com first, it's most common
-                    response_msg = f"✓ Trying to open {url}"
-                else:
-                    response_msg = f"✓ Opened {url} in your default browser"
-                
-                subprocess.run(['open', url], check=True)
-                return response_msg
-            
-            elif tool_name == 'open_app':
-                result = open_app.invoke(params)
-                return result
-            
-            elif tool_name == 'screenshot':
-                result = screenshot_screen.invoke({'path': '/tmp/arc_screenshot.png'})
-                return result
-            
-            elif tool_name == 'is_running':
-                result = is_app_running.invoke(params)
-                app = params['app_name']
-                return f"✓ Yes, {app} is currently running" if result else f"✗ No, {app} is not running"
-            
-            elif tool_name == 'get_datetime':
-                from arc.tools.system_tools import get_current_datetime
-                result = get_current_datetime.invoke({})
-                return result
-            
-            else:
-                return "Tool not implemented yet"
-                
-        except Exception as e:
-            return f"Error executing tool: {str(e)}"
-    
-    # Use AI for general queries
+# Agent Callback
+from arc.brain.graph import create_graph
+
+# Initialize graph once
+agent_graph = create_graph()
+
+async def agent_callback(text_input: str) -> dict:
+    """
+    Callback for voice loop to process input using LangGraph.
+    Returns: {"text": str, "tone": str}
+    """
     try:
-        from langchain_ollama import ChatOllama
+        # Run graph
+        initial_state = {
+            "input_text": text_input,
+            "chat_history": [] # TODO: maintain history
+        }
         
-        llm = ChatOllama(
-            model=config.llm.model_name,
-            base_url=config.llm.base_url,
-            temperature=config.llm.temperature
-        )
+        # Invoke graph (synchronous execution for now due to LangGraph async traits/event loop)
+        import asyncio
+        result = await asyncio.to_thread(agent_graph.invoke, initial_state)
         
-        system_prompt = "You are ARC, a helpful assistant. Be concise and helpful."
+        intent = result.get("intent")
+        tone = "friendly"
         
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_input)
-        ]
+        # Determine Tone
+        if result.get("recovery_attempt"):
+            tone = "apologetic"
+        elif intent == "tool":
+            tone = "neutral"
+            
+        # Determine Text
+        response_text = ""
         
-        response = llm.invoke(messages)
-        return response.content
-        
+        # Check recovery first
+        if result.get("recovery_attempt"):
+            response_text = result.get('final_response', "I'm sorry, something went wrong.")
+
+        elif intent == "chat":
+            response_text = result.get('final_response', "I'm not sure what to say.")
+            
+        elif intent == "tool":
+            tool_res = result.get("tool_result", "")
+            final_res = result.get("final_response", "Done.")
+            
+            # If tool result is an error but recovery didn't trigger, handle gracefully
+            if "error" in str(tool_res).lower() and not result.get("recovery_attempt"):
+                 tone = "apologetic"
+                 response_text = f"{final_res} (Tool result: {tool_res})"
+            else:
+                 response_text = f"{final_res} Result: {tool_res}"
+            
+        else:
+            tone = "apologetic"
+            response_text = "I didn't understand that request."
+            
+        return {"text": response_text, "tone": tone}
+            
     except Exception as e:
-        return f"AI Error: {str(e)}\nMake sure Ollama is running."
+        import traceback
+        traceback.print_exc()
+        return {"text": f"System error: {e}", "tone": "apologetic"}
 
 async def main():
     """Main entry point for CLI mode"""

@@ -67,19 +67,77 @@ class VoiceLoop:
             logger.warning(f"Wake word disabled: {e}")
             logger.info("Running in continuous mode (no wake word)")
             self.wake_detector = None
+            
+        # Ensure TTS model exists
+        await self._ensure_model_exists()
         
         logger.info("✅ Voice loop initialized")
+
+    async def _ensure_model_exists(self):
+        """Check for TTS model and download if missing."""
+        import urllib.request
+        from pathlib import Path
+        
+        model_path = Path(self.config.voice.tts_voice).resolve()
+        
+        # We need both .onnx and .onnx.json (implicit dependency for Piper)
+        json_path = model_path.with_suffix('.onnx.json')
+        
+        if model_path.exists() and json_path.exists():
+            logger.info(f"✅ Voice model found: {model_path.name}")
+            return
+
+        logger.info(f"📥 Downloading voice model to {model_path}...")
+        
+        # Create parent directories
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Default fallback URL for en_US-lessac-medium
+        base_url = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium"
+        model_url = f"{base_url}/en_US-lessac-medium.onnx"
+        json_url = f"{base_url}/en_US-lessac-medium.onnx.json"
+        
+        try:
+            # Download via a thread to strictly avoid blocking the loop, 
+            # though usually initialization is synchronous-ish.
+            def download():
+                logger.info(f"   Downloading .onnx ({model_url})...")
+                urllib.request.urlretrieve(model_url, model_path)
+                logger.info(f"   Downloading .json ({json_url})...")
+                urllib.request.urlretrieve(json_url, json_path)
+            
+            await asyncio.to_thread(download)
+            logger.info("✅ Voice model downloaded successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to download voice model: {e}")
+            logger.warning("TTS may fail if model is missing.")
     
     def _play_sound(self, sound_type: str):
-        """Play confirmation/error sounds."""
-        # Simple beep for confirmation
-        if sound_type == "wake":
-            subprocess.run(["afplay", "/System/Library/Sounds/Tink.aiff"], 
-                         capture_output=True)
-        elif sound_type == "error":
-            subprocess.run(["afplay", "/System/Library/Sounds/Basso.aiff"],
-                         capture_output=True)
-    
+        """
+        Play confirmation/error sounds.
+        Non-blocking and non-fatal.
+        """
+        try:
+            import platform
+            system = platform.system()
+            
+            if system == 'Windows':
+                import winsound
+                # Simple beeps for Windows
+                if sound_type == "wake":
+                    winsound.Beep(1000, 200)  # High pitch
+                elif sound_type == "error":
+                    winsound.Beep(500, 500)   # Low pitch long
+            elif system == 'Darwin':
+                # macOS sounds
+                sound_file = "/System/Library/Sounds/Tink.aiff" if sound_type == "wake" else "/System/Library/Sounds/Basso.aiff"
+                subprocess.run(["afplay", sound_file], check=False, capture_output=True)
+                
+        except Exception as e:
+            # Swallow audio errors to keep loop running
+            logger.debug(f"Audio feedback failed: {e}")
+
     def _is_follow_up_allowed(self) -> bool:
         """Check if we're within follow-up timeout."""
         if not self.last_interaction_time:
@@ -88,31 +146,170 @@ class VoiceLoop:
         elapsed = (datetime.now() - self.last_interaction_time).total_seconds()
         return elapsed < self.conversation_timeout
     
+    async def _speak_async(self, text: str, tone: str = "friendly"):
+        """
+        Speak text via TTS asynchronously.
+        Returns the subprocess.Popen object of the player.
+        """
+        try:
+            import platform
+            import os
+            import tempfile
+            
+            system = platform.system()
+            temp_dir = tempfile.gettempdir()
+            
+            # Paths
+            text_file_path = os.path.join(temp_dir, "arc_speak.txt")
+            audio_file_path = os.path.join(temp_dir, "arc_response.wav")
+            
+            # 1. Write text (used for debugging/logging mainly, Piper input)
+            with open(text_file_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            
+            # 2. Run Piper (Generation is still blocking, usually fast for sentences)
+            # We assume generation is fast enough. If long generation, we'd chunk it.
+            # For now, we generate strictly before playing.
+            from pathlib import Path
+            model_abs_path = str(Path(self.config.voice.tts_voice).resolve())
+            
+            piper_cmd = [
+                "piper",
+                "--model", model_abs_path,
+                "--input_file", text_file_path,
+                "--output_file", audio_file_path
+            ]
+            
+            # Log tone (Phase UX: Tone signal used for logging/future modulation)
+            logger.info(f"🗣️ Speaking ({tone}): {text[:50]}...")
+            
+            subprocess.run(piper_cmd, check=True, capture_output=True)
+            
+            # 3. Play Audio Asynchronously
+            player_process = None
+            
+            if system == 'Windows':
+                # Use PowerShell to confirm blocking-in-process behavior so we can kill it
+                # PlaySync() blocks the PowerShell process, which is what we want for Popen
+                ps_cmd = [
+                    "powershell", 
+                    "-c", 
+                    f"(New-Object Media.SoundPlayer '{audio_file_path}').PlaySync()"
+                ]
+                player_process = subprocess.Popen(ps_cmd)
+                
+            elif system == 'Darwin':
+                player_process = subprocess.Popen(["afplay", audio_file_path])
+                
+            else:
+                player_process = subprocess.Popen(["aplay", audio_file_path])
+                
+            return player_process
+                
+        except Exception as e:
+            logger.error(f"TTS Async failed: {e}")
+            return None
+
+    async def _monitor_playback(self, player_process, check_interval=0.1):
+        """
+        Monitor playback for wake word interruption.
+        Blocks until playback finishes or wake word is detected.
+        """
+        if not player_process:
+            return
+            
+        if not self.wake_detector:
+             # Just wait for process to finish if no means to interrupt
+            player_process.wait()
+            return
+
+        try:
+            import pyaudio
+            import struct
+            
+            pa = pyaudio.PyAudio()
+            # Assuming Porcupine default sample rate (16000) and frame length (512 usually)
+            # We need to access these from wake detector if possible, or hardcode standard
+            # Porcupine is usually 16kHz, 512 frame size.
+            
+            # We need to open a stream specifically for this monitoring
+            stream = pa.open(
+                rate=16000,
+                channels=1,
+                format=pyaudio.paInt16,
+                input=True,
+                frames_per_buffer=512
+            )
+            
+            logger.info("👂 Monitoring for interruption...")
+            
+            while player_process.poll() is None:
+                # Read audio
+                pcm = stream.read(512, exception_on_overflow=False)
+                
+                # Unpack for Porcupine (needs list/tuple of shorts usually, or bytes depending on wrapper)
+                # wake_detector.process usually takes a list of integers
+                pcm_unpacked = struct.unpack_from("h" * 512, pcm)
+                
+                keyword_index = self.wake_detector.process(pcm_unpacked)
+                
+                if keyword_index >= 0:
+                    logger.info("🛑 Interruption Detected!")
+                    
+                    # Stop Audio
+                    player_process.terminate()
+                    
+                    # Play Ding
+                    self._play_sound("wake")
+                    
+                    self.interrupt() # Set flag
+                    break
+                    
+                # Small yield not strictly needed as read is blocking, but good practice
+                await asyncio.sleep(0.01)
+                
+            stream.close()
+            pa.terminate()
+            
+        except Exception as e:
+            logger.error(f"Monitor error: {e}")
+            if player_process:
+                player_process.wait() # Fallback
+
+    async def _speak(self, text: str):
+        # Deprecated by _speak_async but kept for interface compatibility if needed
+        proc = await self._speak_async(text)
+        if proc:
+            proc.wait()
+
     async def process_command(self, skip_wake_word: bool = False):
         """
         Process one voice command.
-        
-        Args:
-            skip_wake_word: If True, skip wake word detection (for follow-ups)
         """
         try:
             # Wait for wake word (unless skipping)
             if not skip_wake_word and self.wake_detector:
-                logger.info("👂 Listening for wake word...")
-                # Note: This is blocking - in real implementation would be async
-                # For now, we skip wake word if not available
+                logger.debug("Waiting for wake word...")
+                # In a real loop, we might block here or use a specific wait method
+                # For now, assuming external trigger or continuous loop structure
+                # Check how start() calls this. It calls process_command repeatedly.
+                # We need a blocking wait for wake word here if we want true wake word mode.
+                # But typically `process_command` assumes it's time to listen.
+                # Ref: Previous implementation just passed.
                 pass
             
             # Play confirmation
             self._play_sound("wake")
             logger.info("🎤 Listening...")
             
-            # Record speech (with timeout)
+            # Record speech
             try:
+                # Flush basic instructions
                 audio = self.stt.record_audio(duration=5.0)
             except Exception as e:
                 logger.error(f"Recording failed: {e}")
-                await self._speak("Sorry, I couldn't hear you")
+                proc = await self._speak_async("Sorry, I couldn't hear you", "apologetic")
+                await self._monitor_playback(proc)
                 return
             
             # Transcribe
@@ -121,46 +318,48 @@ class VoiceLoop:
                 user_input = self.stt.transcribe_audio(audio)
             except Exception as e:
                 logger.error(f"Transcription failed: {e}")
-                await self._speak("Sorry, I didn't catch that")
+                proc = await self._speak_async("Sorry, I didn't catch that", "apologetic")
+                await self._monitor_playback(proc)
                 return
             
             if not user_input.strip():
-                logger.info("No speech detected")
                 return
             
             logger.info(f"You: {user_input}")
             
-            # Check for interrupt commands
+            # Check for interrupt commands (Text-based pre-processing)
             if any(word in user_input.lower() for word in ['stop', 'cancel', 'nevermind']):
-                await self._speak("Okay, cancelled")
+                proc = await self._speak_async("Okay", "neutral")
+                await self._monitor_playback(proc)
                 self.in_conversation = False
                 return
             
-            # Add to conversation history
-            self.conversation_history.append({
-                "role": "user",
-                "content": user_input,
-                "timestamp": datetime.now()
-            })
-            
-            # Send to agent
+            # Send to agent (Updated: expects dict or tuple)
             logger.info("🧠 Processing request...")
             try:
-                response = await self.agent_callback(user_input)
+                # Result is now dict {"text": str, "tone": str}
+                result = await self.agent_callback(user_input)
+                
+                # Handle legacy string return if something missed updates
+                if isinstance(result, str):
+                    response_text = result
+                    tone = "friendly"
+                else:
+                    response_text = result.get("text", "")
+                    tone = result.get("tone", "friendly")
+                    
             except Exception as e:
                 logger.error(f"Agent error: {e}")
-                response = "I encountered an error processing that request. Please try again."
+                response_text = "I encountered an error."
+                tone = "apologetic"
             
-            # Add response to history
-            self.conversation_history.append({
-                "role": "assistant", 
-                "content": response,
-                "timestamp": datetime.now()
-            })
+            # Speak response (Async + Monitor)
+            logger.info(f"ARC ({tone}): {response_text}")
             
-            # Speak response
-            logger.info(f"ARC: {response}")
-            await self._speak(response)
+            player_proc = await self._speak_async(response_text, tone)
+            
+            # Critical: Monitor for interruption while speaking
+            await self._monitor_playback(player_proc)
             
             # Update state
             self.last_interaction_time = datetime.now()
@@ -169,18 +368,6 @@ class VoiceLoop:
         except Exception as e:
             logger.error(f"Command processing error: {e}")
             self._play_sound("error")
-    
-    async def _speak(self, text: str):
-        """Speak text via TTS."""
-        try:
-            # Use command-line piper for reliability
-            subprocess.run(
-                f'echo "{text}" | piper --model {self.config.voice.tts_voice} --output_file /tmp/arc_response.wav && afplay /tmp/arc_response.wav',
-                shell=True,
-                capture_output=True
-            )
-        except Exception as e:
-            logger.error(f"TTS failed: {e}")
     
     async def start(self):
         """Start the voice loop."""
